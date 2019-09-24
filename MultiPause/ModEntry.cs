@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Reflection.Emit;
 using Harmony;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
@@ -20,6 +21,8 @@ namespace MultiPause
 
         static Dictionary<long, STPState> PlayerStates { get; set; } = new Dictionary<long, STPState>();
 
+        static List<CodeInstruction> SavedILCode = new List<CodeInstruction>();
+
         public override void Entry(IModHelper helper)
         {
             Config = helper.ReadConfig<Config>();
@@ -27,7 +30,12 @@ namespace MultiPause
             _shouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
 
             var harmony = HarmonyInstance.Create("taw.multipause");
-            harmony.PatchAll();
+            this.Monitor.Log("Patching shouldTimePass()");
+            harmony.Patch(typeof(Game1).GetMethod("shouldTimePass"), prefix: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Prefix")), transpiler: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Transpile")));
+            this.Monitor.Log("Copying single-player shouldTimePass() logic for MultiPause check");
+            harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));
+            this.Monitor.Log("Patching complete.");
+
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.Multiplayer.PeerContextReceived += this.OnPeerContextReceived;
             helper.Events.Multiplayer.ModMessageReceived += this.OnModMessageReceived;
@@ -36,7 +44,15 @@ namespace MultiPause
             helper.Events.GameLoop.DayStarted += this.OnDayStarted;
         }
 
-        public static bool ShouldTimePassForCurrentPlayer()
+        public static IEnumerable<CodeInstruction> CopySTPMethod(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
+        {
+            foreach (var c in SavedILCode)
+            {
+                yield return c;
+            }
+        }
+
+            public static bool ShouldTimePassForCurrentPlayer()
         {
             if (Game1.isFestival() || Game1.CurrentEvent != null && Game1.CurrentEvent.isWedding)
                 return false;
@@ -237,6 +253,25 @@ namespace MultiPause
                 if (Game1.IsMultiplayer)
                 {
                     __result = !ShouldPause();
+                }
+            }
+
+            public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
+            {
+                foreach (var c in instructions)
+                {
+                    if (c.opcode == OpCodes.Call && c.operand.ToString().StartsWith("Boolean get_IsMultiplayer()"))
+                    {
+                        CodeInstruction loadFalse = new CodeInstruction(OpCodes.Ldc_I4_0);
+                        loadFalse.labels = c.labels;
+                        SavedILCode.Add(loadFalse);
+                        yield return loadFalse;
+                    }
+                    else
+                    {
+                        SavedILCode.Add(c);
+                        yield return c;
+                    }
                 }
             }
         }
