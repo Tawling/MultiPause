@@ -30,11 +30,7 @@ namespace MultiPause
             _shouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
 
             var harmony = HarmonyInstance.Create("taw.multipause");
-            this.Monitor.Log("Patching shouldTimePass()");
             harmony.Patch(typeof(Game1).GetMethod("shouldTimePass"), prefix: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Prefix")), transpiler: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Transpile")));
-            this.Monitor.Log("Copying single-player shouldTimePass() logic for MultiPause check");
-            harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));
-            this.Monitor.Log("Patching complete.");
 
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.Multiplayer.PeerContextReceived += this.OnPeerContextReceived;
@@ -273,6 +269,24 @@ namespace MultiPause
                         yield return c;
                     }
                 }
+
+                using (System.IO.StreamWriter file = new System.IO.StreamWriter(@"C:\Users\Taw\source\repos\MultiPause\log.txt"))
+                {
+                    foreach (var c in SavedILCode)
+                    {
+                        file.WriteLine(c);
+                    }
+                }
+
+                var harmony = HarmonyInstance.Create("taw.multipause.instance2");
+                using (System.IO.StreamWriter file = new System.IO.StreamWriter(@"C:\Users\Taw\source\repos\MultiPause\log.txt"))
+                {
+                    foreach (var c in SavedILCode)
+                    {
+                        file.WriteLine(c);
+                    }
+                }
+                harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));
             }
         }
 
