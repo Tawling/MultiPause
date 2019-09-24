@@ -1,0 +1,10 @@
+﻿{
+  "Name": "MultiPause",
+  "Author": "Taw",
+  "Version": "1.0.0",
+  "Description": "Adds mechanisms for time to be paused in multi-player when players are in menus or other situations that would normally pause time in single-player mode.",
+  "UniqueID": "taw.multipause",
+  "EntryDll": "MultiPause.dll",
+  "MinimumApiVersion": "2.10.0",
+  "UpdateKeys": []
+}
