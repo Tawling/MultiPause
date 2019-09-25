@@ -23,14 +23,33 @@ namespace MultiPause
 
         static List<CodeInstruction> SavedILCode = new List<CodeInstruction>();
 
+        static IMonitor monitor;
+
+        public void logStates()
+        {
+            foreach (var s in PlayerStates)
+            {
+                monitor.Log($"{s.Key}: {{ShouldTimePass: {s.Value.ShouldTimePass}, IsOnline: {s.Value.IsOnline}, TotalTimePaused: {s.Value.TotalTimePaused}}}");
+            }
+        }
+
         public override void Entry(IModHelper helper)
         {
             Config = helper.ReadConfig<Config>();
 
+            monitor = this.Monitor;
+
             _shouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
 
-            var harmony = HarmonyInstance.Create("taw.multipause");
-            harmony.Patch(typeof(Game1).GetMethod("shouldTimePass"), prefix: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Prefix")), transpiler: new HarmonyMethod(typeof(ShouldTimePassPatch).GetMethod("Transpile")));
+            monitor.Log($"Pause mode: {Config.PauseMode_ANY_ALL_AUTO}");
+
+            var harmony = HarmonyInstance.Create("taw.multipause.patch1");
+            monitor.Log("Patching...");
+
+            var original = typeof(Game1).GetMethod("shouldTimePass");
+            var prefix = typeof(ShouldTimePassPatch).GetMethod("Prefix");
+            var transpiler = typeof(ShouldTimePassPatch).GetMethod("Transpiler");
+            harmony.Patch(original, prefix: new HarmonyMethod(prefix), transpiler: new HarmonyMethod(transpiler));
 
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.Multiplayer.PeerContextReceived += this.OnPeerContextReceived;
@@ -46,6 +65,7 @@ namespace MultiPause
             {
                 yield return c;
             }
+            monitor.Log("Copied method");
         }
 
             public static bool ShouldTimePassForCurrentPlayer()
@@ -107,11 +127,11 @@ namespace MultiPause
                     PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out STPState state);
                     if (state != null && state.IsOnline && state.TotalTimePaused <= min)
                     {
-                        if (min == state.TotalTimePaused && !state.ShouldTimePass)
+                        if (state.TotalTimePaused == min && !state.ShouldTimePass)
                         {
                             minPaused = true;
                         }
-                        else if (min < state.TotalTimePaused)
+                        else if (state.TotalTimePaused < min)
                         {
                             min = state.TotalTimePaused;
                             minPaused = !state.ShouldTimePass;
@@ -143,12 +163,15 @@ namespace MultiPause
 
                     STPMessage message = new STPMessage(shouldTimePass);
                     this.Helper.Multiplayer.SendMessage(message, "ShouldTimePassState", modIDs: new[] { this.ModManifest.UniqueID });
-            }
+                    monitor.Log($"Sent state {shouldTimePass}");
+                    logStates();
+                }
 
                 if (!queryMessageSent)
                 {
                     this.Helper.Multiplayer.SendMessage(true, "QueryShouldTimePassStates", modIDs: new[] { this.ModManifest.UniqueID });
                     queryMessageSent = true;
+                    monitor.Log("Sent query message");
                 }
             } else
             {
@@ -185,6 +208,8 @@ namespace MultiPause
                 dictState.ShouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
                 dictState.IsOnline = true;
             }
+            monitor.Log($"Player joined {e.Peer.PlayerID}");
+            logStates();
         }
 
         private void OnModMessageReceived(object sender, ModMessageReceivedEventArgs e)
@@ -193,8 +218,11 @@ namespace MultiPause
             {
                 STPMessage message = e.ReadAs<STPMessage>();
                 SetPlayerState(e.FromPlayerID, message.ShouldTimePass, ticks: message.Ticks);
+                monitor.Log($"Received state {message.ShouldTimePass} from {e.FromPlayerID}");
+                logStates();
             } else if (e.Type == "QueryShouldTimePassStates" && e.FromModID == this.ModManifest.UniqueID)
             {
+                monitor.Log($"Query received from {e.FromPlayerID}");
                 this.Helper.Multiplayer.SendMessage(_shouldTimePass, "ShouldTimePassState", modIDs: new[] { this.ModManifest.UniqueID });
             }
         }
@@ -213,6 +241,7 @@ namespace MultiPause
                 dictState.ShouldTimePass = false;
                 dictState.IsOnline = false;
             }
+            monitor.Log($"Player left {e.Peer.PlayerID}");
         }
 
         private void OnReturnedToTitle(object sender, ReturnedToTitleEventArgs e)
@@ -226,6 +255,8 @@ namespace MultiPause
             {
                 entry.Value.TotalTimePaused = 0;
             }
+            monitor.Log($"Reset entries to 0");
+            logStates();
         }
 
         class STPMessage
@@ -244,12 +275,14 @@ namespace MultiPause
         [HarmonyPatch("shouldTimePass")]
         class ShouldTimePassPatch
         {
-            static void Postfix(ref bool __result)
+            public static bool Prefix(ref bool __result)
             {
                 if (Game1.IsMultiplayer)
                 {
                     __result = !ShouldPause();
+                    return false;
                 }
+                return true;
             }
 
             public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
@@ -269,9 +302,9 @@ namespace MultiPause
                         yield return c;
                     }
                 }
-
-                var harmony = HarmonyInstance.Create("taw.multipause.instance2");
-                harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));
+                monitor.Log($"Patched.");// Copying method...");
+                /*var harmony = HarmonyInstance.Create("taw.multipause.patch2");
+                harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));*/
             }
         }
 
