@@ -6,5 +6,5 @@
   "UniqueID": "taw.multipause",
   "EntryDll": "MultiPause.dll",
   "MinimumApiVersion": "2.10.0",
-  "UpdateKeys": []
+  "UpdateKeys": ["GitHub:Tawling/MultiPause"]
 }
