@@ -12,11 +12,11 @@ single-player-paused states include:
 
 Depending on your config settings, if some or all players are in a single-player-paused state, time will pause for everyone.
 
-**Only the host's config settings will be used.**
+**Only the host's config settings will be used**, however all players should have the mod installed.
 
 The config file allows for three different pause modes: `"ANY"`, `"ALL"`, and `"AUTO"`. Default mode is `"AUTO"`.
 
-With the exxception of the `"ANY"` mode, this mod is designed to provide ways to allow time to pause in multiplayer without giving players extra time "for free."
+With the exception of the `"ANY"` mode, this mod is designed to provide ways to allow time to pause in multiplayer without giving players extra time "for free."
 See detailed descriptions of each pause mode below.
 
 ***WARNING: This mod uses [Harmony](https://github.com/pardeike/Harmony) to edit the game's `shouldTimePass()` method. This has the potential to conflict with other mods that may attempt to modify this same function.***

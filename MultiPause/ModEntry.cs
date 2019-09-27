@@ -1,75 +1,276 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Reflection.Emit;
-using Harmony;
+﻿using Harmony;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection.Emit;
 
 namespace MultiPause
 {
-    public class ModEntry : StardewModdingAPI.Mod
+    class ModEntry : Mod
     {
-        public const string PAUSE_IF_ANY = "ANY";
-        public const string PAUSE_IF_ALL = "ALL";
-        public const string AUTO_PAUSE_FOR_BALANCE = "AUTO";
+        /**********
+        ** Constants
+        **********/
+        public const string PAUSE_ANY = "ANY";
+        public const string PAUSE_ALL = "ALL";
+        public const string PAUSE_AUTO = "AUTO";
 
-        bool _shouldTimePass = false;
-        bool queryMessageSent = false;
-
-        public static Config Config { get; private set; }
-
-        static Dictionary<long, STPState> PlayerStates { get; set; } = new Dictionary<long, STPState>();
-
-        static List<CodeInstruction> SavedILCode = new List<CodeInstruction>();
-
-        static IMonitor monitor;
-
-        public void logStates()
+        public enum TimePassState
         {
-            foreach (var s in PlayerStates)
-            {
-                monitor.Log($"{s.Key}: {{ShouldTimePass: {s.Value.ShouldTimePass}, IsOnline: {s.Value.IsOnline}, TotalTimePaused: {s.Value.TotalTimePaused}}}");
-            }
+            Pass,
+            Freeze,
+            Pause
         }
 
+        /**********
+        ** Properties
+        **********/
+
+        public bool IsPaused = false;
+        public bool QueryMessageSent = false;
+
+        public string PauseMode;
+        public bool InitialPauseState => PauseMode != PAUSE_ANY;
+
+        int prevGameTimeInterval = -1;
+        TimePassState prevTimePassState = TimePassState.Pass;
+        bool patched = false;
+
+        public static Config Config { get; private set; }
+        static Dictionary<long, PlayerState> PlayerStates { get; set; } = new Dictionary<long, PlayerState>();
+
+        public static bool ForceSinglePlayerCheck = false;
+
+        /**********
+        ** Public methods
+        **********/
         public override void Entry(IModHelper helper)
         {
+
             Config = helper.ReadConfig<Config>();
 
-            monitor = this.Monitor;
+            PauseMode = Config.PauseMode_ANY_ALL_AUTO.ToUpper();
 
-            _shouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
-
-            monitor.Log($"Pause mode: {Config.PauseMode_ANY_ALL_AUTO}");
-
-            var harmony = HarmonyInstance.Create("taw.multipause.patch1");
-            monitor.Log("Patching...");
-
-            var original = typeof(Game1).GetMethod("shouldTimePass");
-            var prefix = typeof(ShouldTimePassPatch).GetMethod("Prefix");
-            var transpiler = typeof(ShouldTimePassPatch).GetMethod("Transpiler");
-            harmony.Patch(original, prefix: new HarmonyMethod(prefix), transpiler: new HarmonyMethod(transpiler));
-
+            helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;
+            helper.Events.GameLoop.SaveLoaded += this.OnSaveLoaded;
+            helper.Events.GameLoop.DayStarted += this.OnDayStarted;
+            helper.Events.GameLoop.ReturnedToTitle += this.OnReturnedToTitle;
             helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
             helper.Events.Multiplayer.PeerContextReceived += this.OnPeerContextReceived;
             helper.Events.Multiplayer.ModMessageReceived += this.OnModMessageReceived;
             helper.Events.Multiplayer.PeerDisconnected += this.OnPeerDisconnected;
-            helper.Events.GameLoop.ReturnedToTitle += this.OnReturnedToTitle;
-            helper.Events.GameLoop.DayStarted += this.OnDayStarted;
         }
 
-        public static IEnumerable<CodeInstruction> CopySTPMethod(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
+        void applyPatch()
         {
-            foreach (var c in SavedILCode)
+            if (patched) return;
+            Monitor.Log("Patching StardewValley.Game1 - Boolean shouldTimePass()", LogLevel.Debug);
+            var harmony = HarmonyInstance.Create("taw.multipause");
+            var original = typeof(Game1).GetMethod("shouldTimePass");
+            var prefix = typeof(ShouldTimePassPatch).GetMethod("Prefix");
+            var transpiler = typeof(ShouldTimePassPatch).GetMethod("Transpiler");
+            harmony.Patch(original, prefix: new HarmonyMethod(prefix), transpiler: new HarmonyMethod(transpiler));
+            patched = true;
+        }
+
+        public void OnGameLaunched(object sender, GameLaunchedEventArgs e)
+        {
+            Monitor.Log("Game Launched");
+
+            applyPatch();
+
+        }
+
+        public void OnSaveLoaded(object sender, SaveLoadedEventArgs e)
+        {
+            if (Context.IsMultiplayer)
             {
-                yield return c;
+                if (!Context.IsMainPlayer)
+                    Monitor.Log("Connected as non-host player. Only the host's PauseMode config setting will be used.", LogLevel.Info);
+                else
+                    Monitor.Log($"Connected as host player. PauseMode set to \"{PauseMode}\"", LogLevel.Info);
             }
-            monitor.Log("Copied method");
+
+            IsPaused = InitialPauseState;
+
+            PlayerStates = new Dictionary<long, PlayerState>();
+            var state = GetPlayerState(Game1.player.UniqueMultiplayerID);
+            state.IsHost = Context.IsMainPlayer;
+            state.ConfigPauseMode = PauseMode;
         }
 
-            public static bool ShouldTimePassForCurrentPlayer()
+        public void OnDayStarted(object sender, DayStartedEventArgs e)
         {
+            foreach (KeyValuePair<long, PlayerState> entry in PlayerStates)
+            {
+                entry.Value.TotalTimePaused = 0;
+            }
+        }
+
+        public void OnReturnedToTitle(object sender, ReturnedToTitleEventArgs e)
+        {
+            QueryMessageSent = false;
+        }
+
+        public void OnUpdateTicked(object sender, UpdateTickedEventArgs e)
+        {
+            if (Context.IsWorldReady && Game1.IsMultiplayer)
+            {
+                // Update states if host player
+                foreach (KeyValuePair<long, PlayerState> entry in PlayerStates)
+                {
+                    if (entry.Value.IsPaused || !entry.Value.IsOnline)
+                    {
+                        entry.Value.TotalTimePaused++;
+                    }
+                }
+
+                // Retrieve state as if in single player
+                ForceSinglePlayerCheck = true;
+                var isPaused = !Game1.shouldTimePass();
+                ForceSinglePlayerCheck = false;
+
+                // Check player's pause state and broadcast changes
+                if (isPaused != IsPaused)
+                {
+                    IsPaused = isPaused;
+                    var state = GetPlayerState(Game1.player.UniqueMultiplayerID);
+                    state.IsPaused = isPaused;
+                    state.Ticks = Game1.ticks;
+
+                    if (PauseMode != Config.PauseMode_ANY_ALL_AUTO.ToUpper())
+                    {
+                        state.ConfigPauseMode = Config.PauseMode_ANY_ALL_AUTO.ToUpper();
+                        if (Context.IsMainPlayer)
+                            PauseMode = state.ConfigPauseMode;
+                    }
+
+                    this.Helper.Multiplayer.SendMessage(state, STPMessage.Update, modIDs: new[] { this.ModManifest.UniqueID });
+                }
+
+                TimePassState timePassState = GetTimePassState();
+                if (timePassState != TimePassState.Pass)
+                {
+                    Game1.gameTimeInterval = prevGameTimeInterval;
+                }
+                else
+                {
+                    prevGameTimeInterval = Game1.gameTimeInterval;
+                }
+
+                if (timePassState != prevTimePassState)
+                {
+                    prevTimePassState = timePassState;
+                    Monitor.Log($"Time is now {(timePassState == TimePassState.Pass ? "passing normally" : (timePassState == TimePassState.Freeze ? "frozen" : "paused"))}.", LogLevel.Info);
+                    foreach (var state in PlayerStates)
+                    {
+                        Monitor.Log($"{state.Key} -- {state.Value}");
+                    }
+                }
+
+                // Send query message if needed
+                if (!QueryMessageSent)
+                {
+                    this.Helper.Multiplayer.SendMessage(true, STPMessage.Query, modIDs: new[] { this.ModManifest.UniqueID });
+                    QueryMessageSent = true;
+                }
+            }
+            else
+            {
+                QueryMessageSent = false;
+            }
+        }
+
+        public void OnPeerContextReceived(object sender, PeerContextReceivedEventArgs e)
+        {
+            var state = GetPlayerState(e.Peer.PlayerID);
+
+            state.IsOnline = true;
+            state.IsPaused = InitialPauseState;
+        }
+
+        public void OnPeerDisconnected(object sender, PeerDisconnectedEventArgs e)
+        {
+            var state = GetPlayerState(e.Peer.PlayerID);
+            state.IsOnline = false;
+            state.IsPaused = true;
+        }
+
+        public void OnModMessageReceived(object sender, ModMessageReceivedEventArgs e)
+        {
+            if (e.Type == STPMessage.Update && e.FromModID == this.ModManifest.UniqueID)
+            {
+                // Update player state based on message
+                var messageState = e.ReadAs<PlayerState>();
+                var state = GetPlayerState(e.FromPlayerID);
+                if (state.IsOnline && messageState.Ticks >= state.Ticks) {
+                    state.Ticks = messageState.Ticks;
+                    state.IsPaused = messageState.IsPaused;
+                    state.IsHost = messageState.IsHost;
+                    state.ConfigPauseMode = messageState.ConfigPauseMode;
+                    if (state.IsHost && PauseMode != state.ConfigPauseMode)
+                        PauseMode = state.ConfigPauseMode;
+                }
+            }
+            else if (e.Type == STPMessage.Query && e.FromModID == this.ModManifest.UniqueID)
+            {
+                var state = GetPlayerState(Game1.player.UniqueMultiplayerID);
+                this.Helper.Multiplayer.SendMessage(state, STPMessage.Update, modIDs: new[] { this.ModManifest.UniqueID });
+                // Host needs to send all player states so clients can synchronize values such as TotalTimePaused
+                if (Context.IsMainPlayer)
+                {
+                    this.Helper.Multiplayer.SendMessage(PlayerStates, STPMessage.AllPlayerStates, modIDs: new[] { this.ModManifest.UniqueID });
+                }
+            }
+            else if (e.Type == STPMessage.AllPlayerStates && e.FromModID == this.ModManifest.UniqueID)
+            {
+                var message = e.ReadAs<Dictionary<long, PlayerState>>();
+                foreach(var item in message)
+                {
+                    var state = GetPlayerState(item.Key);
+                    state.TotalTimePaused = item.Value.TotalTimePaused;
+                    state.IsOnline = item.Value.IsOnline;
+                    state.IsHost = item.Value.IsHost;
+                    state.ConfigPauseMode = item.Value.ConfigPauseMode;
+                }
+            }
+        }
+
+        /**********
+        ** Methods
+        **********/
+
+        void ReloadConfig()
+        {
+            Config = Helper.ReadConfig<Config>();
+        }
+
+        PlayerState GetPlayerState(long playerID)
+        {
+            PlayerStates.TryGetValue(playerID, out PlayerState dictState);
+            if (dictState == null)
+            {
+                dictState = new PlayerState(InitialPauseState, 0, totalTimePaused: GetMinTimePaused());
+                PlayerStates.Add(playerID, dictState);
+            }
+            return dictState;
+        }
+
+        /**********
+        ** Static methods
+        **********/
+
+        public static bool GetIsMultiplayerForShouldTimePass()
+        {
+            return ForceSinglePlayerCheck ? false : Game1.IsMultiplayer;
+        }
+
+        public static bool ShouldTimePassForCurrentPlayer()
+        {
+            // Vanilla logic minus multiplayer check
             if (Game1.isFestival() || Game1.CurrentEvent != null && Game1.CurrentEvent.isWedding)
                 return false;
             if (Game1.paused || Game1.freezeControls || Game1.overlayMenu != null || Game1.activeClickableMenu != null && !(Game1.activeClickableMenu is StardewValley.Menus.BobberBar))
@@ -83,193 +284,115 @@ namespace MultiPause
         {
             int min = Int32.MaxValue;
 
-            foreach (KeyValuePair<long, STPState> entry in PlayerStates)
+            foreach (KeyValuePair<long, PlayerState> entry in PlayerStates)
             {
                 min = Math.Min(min, entry.Value.TotalTimePaused);
             }
 
-            return min;
+            return Math.Max(min, 0);
         }
 
-        public static bool ShouldPause()
+        public static TimePassState GetTimePassState()
         {
-            if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ALL)
+            bool freeze = false;
+            bool allPaused = true;
+            if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_ALL)
             {
                 foreach (Farmer farmer in Game1.getOnlineFarmers())
                 {
-                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out STPState state);
-                    if (state != null && state.IsOnline && state.ShouldTimePass)
+                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out PlayerState state);
+                    if (state != null && state.IsOnline && !state.IsPaused)
                     {
-                        return false;
+                        allPaused = false;
                     }
                 }
-                return true;
+                freeze = allPaused;
             }
-            else if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY)
+            else if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_ANY)
             {
                 foreach (Farmer farmer in Game1.getOnlineFarmers())
                 {
-                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out STPState state);
-                    if (state != null && state.IsOnline && !state.ShouldTimePass)
+                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out PlayerState state);
+                    if (state != null && state.IsOnline)
                     {
-                        return true;
+                        if (state.IsPaused)
+                        {
+                            freeze = true;
+                        }
+                        else
+                        {
+                            allPaused = false;
+                        }
                     }
                 }
-                return false;
             }
-            else if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == AUTO_PAUSE_FOR_BALANCE)
+            else if (Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_AUTO)
             {
 
                 int min = Int32.MaxValue;
-                bool minPaused = false;
                 foreach (Farmer farmer in Game1.getOnlineFarmers())
                 {
-                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out STPState state);
-                    if (state != null && state.IsOnline && state.TotalTimePaused <= min)
+                    PlayerStates.TryGetValue(farmer.UniqueMultiplayerID, out PlayerState state);
+                    if (state != null && state.IsOnline)
                     {
-                        if (state.TotalTimePaused == min && !state.ShouldTimePass)
+                        if (!state.IsPaused) allPaused = false;
+
+                        if (state.TotalTimePaused == min && state.IsPaused)
                         {
-                            minPaused = true;
+                            freeze = true;
                         }
                         else if (state.TotalTimePaused < min)
                         {
                             min = state.TotalTimePaused;
-                            minPaused = !state.ShouldTimePass;
+                            freeze = state.IsPaused;
                         }
                     }
                 }
-                return minPaused;
             }
-            return false;
+            return freeze ? (allPaused ? TimePassState.Pause : TimePassState.Freeze) : TimePassState.Pass;
         }
 
-        private void OnUpdateTicked(object sender, UpdateTickedEventArgs e)
-        {
-            foreach (KeyValuePair<long, STPState> entry in PlayerStates)
-            {
-                if (!entry.Value.ShouldTimePass || !entry.Value.IsOnline)
-                {
-                    entry.Value.TotalTimePaused++;
-                }
-            }
 
-            if (Context.IsWorldReady)
-            {
-                var shouldTimePass = ShouldTimePassForCurrentPlayer();
-                if (shouldTimePass != _shouldTimePass)
-                {
-                    _shouldTimePass = shouldTimePass;
-                    SetPlayerState(Game1.player.UniqueMultiplayerID, shouldTimePass, Game1.ticks);
 
-                    STPMessage message = new STPMessage(shouldTimePass);
-                    this.Helper.Multiplayer.SendMessage(message, "ShouldTimePassState", modIDs: new[] { this.ModManifest.UniqueID });
-                    monitor.Log($"Sent state {shouldTimePass}");
-                    logStates();
-                }
-
-                if (!queryMessageSent)
-                {
-                    this.Helper.Multiplayer.SendMessage(true, "QueryShouldTimePassStates", modIDs: new[] { this.ModManifest.UniqueID });
-                    queryMessageSent = true;
-                    monitor.Log("Sent query message");
-                }
-            } else
-            {
-                queryMessageSent = false;
-            }
-        }
-
-        private void SetPlayerState(long playerID, bool state, int ticks = -1, int totalTimePaused = -1)
-        {
-            PlayerStates.TryGetValue(playerID, out STPState dictState);
-            if (dictState == null)
-            {
-                dictState = new STPState(state, ticks);
-                PlayerStates.Add(playerID, dictState);
-            }
-
-            dictState.ShouldTimePass = state;
-            if (ticks > -1)
-                dictState.Ticks = ticks;
-            if (totalTimePaused > -1)
-                dictState.TotalTimePaused = totalTimePaused;
-        }
-
-        private void OnPeerContextReceived(object sender, PeerContextReceivedEventArgs e)
-        {
-            PlayerStates.TryGetValue(e.Peer.PlayerID, out STPState dictState);
-            if (dictState == null)
-            {
-                dictState = new STPState(Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY, 0, totalTimePaused: GetMinTimePaused(), online: true);
-                PlayerStates.Add(e.Peer.PlayerID, dictState);
-            }
-            else
-            {
-                dictState.ShouldTimePass = Config.PauseMode_ANY_ALL_AUTO.ToUpper() == PAUSE_IF_ANY;
-                dictState.IsOnline = true;
-            }
-            monitor.Log($"Player joined {e.Peer.PlayerID}");
-            logStates();
-        }
-
-        private void OnModMessageReceived(object sender, ModMessageReceivedEventArgs e)
-        {
-            if (e.Type == "ShouldTimePassState" && e.FromModID == this.ModManifest.UniqueID)
-            {
-                STPMessage message = e.ReadAs<STPMessage>();
-                SetPlayerState(e.FromPlayerID, message.ShouldTimePass, ticks: message.Ticks);
-                monitor.Log($"Received state {message.ShouldTimePass} from {e.FromPlayerID}");
-                logStates();
-            } else if (e.Type == "QueryShouldTimePassStates" && e.FromModID == this.ModManifest.UniqueID)
-            {
-                monitor.Log($"Query received from {e.FromPlayerID}");
-                this.Helper.Multiplayer.SendMessage(_shouldTimePass, "ShouldTimePassState", modIDs: new[] { this.ModManifest.UniqueID });
-            }
-        }
-
-        private void OnPeerDisconnected(object sender, PeerDisconnectedEventArgs e)
-        {
-            PlayerStates.TryGetValue(e.Peer.PlayerID, out STPState dictState);
-            if (dictState == null)
-            {
-                dictState = new STPState(false, 0, totalTimePaused: GetMinTimePaused(), online: false);
-                PlayerStates.Add(e.Peer.PlayerID, dictState);
-            }
-            else
-            {
-
-                dictState.ShouldTimePass = false;
-                dictState.IsOnline = false;
-            }
-            monitor.Log($"Player left {e.Peer.PlayerID}");
-        }
-
-        private void OnReturnedToTitle(object sender, ReturnedToTitleEventArgs e)
-        {
-            queryMessageSent = false;
-        }
-
-        private void OnDayStarted(object sender, DayStartedEventArgs e)
-        {
-            foreach (KeyValuePair<long, STPState> entry in PlayerStates)
-            {
-                entry.Value.TotalTimePaused = 0;
-            }
-            monitor.Log($"Reset entries to 0");
-            logStates();
-        }
+        /**********
+        ** Classes
+        **********/
 
         class STPMessage
         {
-            public bool ShouldTimePass;
-            public int Ticks;
+            public static string Query { get; } = "QueryStates";
+            public static string Update { get; } = "PlayerStateChanged";
+            public static string AllPlayerStates { get; } = "AllPauseTimes";
+        }
+        class PlayerState
+        {
+            public bool IsPaused = false;
+            public int Ticks = 0;
+            public int TotalTimePaused;
+            public bool IsOnline;
+            public bool IsHost;
+            public string ConfigPauseMode;
 
-            public STPMessage(bool shouldTimePass)
+            public PlayerState(bool isPaused, int ticks, int totalTimePaused = 0, bool isOnline = true, bool isHost = false, string configPauseMode = PAUSE_AUTO)
             {
-                this.ShouldTimePass = shouldTimePass;
-                Ticks = Game1.ticks;
+                IsPaused = isPaused;
+                Ticks = ticks;
+                TotalTimePaused = totalTimePaused;
+                IsOnline = isOnline;
+                IsHost = isHost;
+                ConfigPauseMode = configPauseMode;
+            }
+
+            public override string ToString()
+            {
+                return $"paused: {IsPaused}, total: {TotalTimePaused}, online: {IsOnline}, host: {IsHost}, mode: {ConfigPauseMode}";
             }
         }
+
+
+        /**********
+        ** Harmony patches
+        **********/
 
         [HarmonyPatch(typeof(Game1))]
         [HarmonyPatch("shouldTimePass")]
@@ -277,9 +400,9 @@ namespace MultiPause
         {
             public static bool Prefix(ref bool __result)
             {
-                if (Game1.IsMultiplayer)
+                if (Game1.IsMultiplayer && !ForceSinglePlayerCheck)
                 {
-                    __result = !ShouldPause();
+                    __result = GetTimePassState() == TimePassState.Pass;
                     return false;
                 }
                 return true;
@@ -287,40 +410,19 @@ namespace MultiPause
 
             public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator generator)
             {
-                foreach (var c in instructions)
+                List<CodeInstruction> instructionList = instructions.ToList();
+
+                for (int i = 0; i < instructionList.Count; i++)
                 {
-                    if (c.opcode == OpCodes.Call && c.operand.ToString().StartsWith("Boolean get_IsMultiplayer()"))
+                    CodeInstruction c = instructionList[i];
+                    if (c.opcode == OpCodes.Call && c.operand.ToString().Contains("get_IsMultiplayer"))
                     {
-                        CodeInstruction loadFalse = new CodeInstruction(OpCodes.Ldc_I4_0);
-                        loadFalse.labels = c.labels;
-                        SavedILCode.Add(loadFalse);
-                        yield return loadFalse;
-                    }
-                    else
-                    {
-                        SavedILCode.Add(c);
-                        yield return c;
+                        instructionList[i] = new CodeInstruction(opcode: OpCodes.Call, operand: typeof(ModEntry).GetMethod("GetIsMultiplayerForShouldTimePass"));
+                        instructionList[i].labels = c.labels;
                     }
                 }
-                monitor.Log($"Patched.");// Copying method...");
-                /*var harmony = HarmonyInstance.Create("taw.multipause.patch2");
-                harmony.Patch(typeof(ModEntry).GetMethod("ShouldTimePassForCurrentPlayer"), transpiler: new HarmonyMethod(typeof(ModEntry).GetMethod("CopySTPMethod")));*/
-            }
-        }
 
-        class STPState
-        {
-            public bool ShouldTimePass = false;
-            public int Ticks;
-            public int TotalTimePaused = 0;
-            public bool IsOnline = true;
-
-            public STPState(bool state, int ticks, int totalTimePaused = 0, bool online = true)
-            {
-                ShouldTimePass = state;
-                Ticks = ticks;
-                TotalTimePaused = totalTimePaused;
-                IsOnline = online;
+                return instructionList.AsEnumerable();
             }
         }
     }
