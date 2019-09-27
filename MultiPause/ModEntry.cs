@@ -154,7 +154,7 @@ namespace MultiPause
                 TimePassState timePassState = GetTimePassState();
                 if (timePassState != TimePassState.Pass)
                 {
-                    Game1.gameTimeInterval = prevGameTimeInterval;
+                    Game1.gameTimeInterval = Game1.gameTimeInterval < prevGameTimeInterval ? 0 : prevGameTimeInterval;
                 }
                 else
                 {
