@@ -402,7 +402,7 @@ namespace MultiPause
             {
                 if (Game1.IsMultiplayer && !ForceSinglePlayerCheck)
                 {
-                    __result = GetTimePassState() == TimePassState.Pass;
+                    __result = GetTimePassState() != TimePassState.Pause;
                     return false;
                 }
                 return true;
