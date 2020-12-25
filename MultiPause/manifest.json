@@ -5,6 +5,6 @@
   "Description": "Adds mechanisms for time to be paused in multi-player when players are in menus or other situations that would normally pause time in single-player mode.",
   "UniqueID": "taw.multipause",
   "EntryDll": "MultiPause.dll",
-  "MinimumApiVersion": "2.10.0",
+  "MinimumApiVersion": "3.8.0",
   "UpdateKeys": ["GitHub:Tawling/MultiPause"]
 }
